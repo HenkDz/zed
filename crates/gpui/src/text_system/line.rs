@@ -75,6 +75,11 @@ impl ShapedLine {
             descent: layout.descent,
             runs: layout.runs.clone(),
             len,
+            index_positions: if len == layout.len {
+                layout.index_positions.clone()
+            } else {
+                Vec::new()
+            },
         });
         self
     }
@@ -222,28 +227,36 @@ impl ShapedLine {
         let left_width = x_offset;
         let right_width = self.layout.width - left_width;
 
+        let mut left_layout = LineLayout {
+            font_size: self.layout.font_size,
+            width: left_width,
+            ascent: self.layout.ascent,
+            descent: self.layout.descent,
+            runs: left_runs,
+            len: byte_index,
+            index_positions: Vec::new(),
+        };
+        left_layout.compute_bidi_index_positions(&left_text);
+
+        let mut right_layout = LineLayout {
+            font_size: self.layout.font_size,
+            width: right_width,
+            ascent: self.layout.ascent,
+            descent: self.layout.descent,
+            runs: right_runs,
+            len: self.layout.len - byte_index,
+            index_positions: Vec::new(),
+        };
+        right_layout.compute_bidi_index_positions(&right_text);
+
         let left = ShapedLine {
-            layout: Arc::new(LineLayout {
-                font_size: self.layout.font_size,
-                width: left_width,
-                ascent: self.layout.ascent,
-                descent: self.layout.descent,
-                runs: left_runs,
-                len: byte_index,
-            }),
+            layout: Arc::new(left_layout),
             text: left_text,
             decoration_runs: left_decorations,
         };
 
         let right = ShapedLine {
-            layout: Arc::new(LineLayout {
-                font_size: self.layout.font_size,
-                width: right_width,
-                ascent: self.layout.ascent,
-                descent: self.layout.descent,
-                runs: right_runs,
-                len: self.layout.len - byte_index,
-            }),
+            layout: Arc::new(right_layout),
             text: right_text,
             decoration_runs: right_decorations,
         };
@@ -783,6 +796,7 @@ mod tests {
                     glyphs: shaped_glyphs,
                 }],
                 len: text.len(),
+                index_positions: Vec::new(),
             }),
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
@@ -901,6 +915,7 @@ mod tests {
                     },
                 ],
                 len: 6,
+                index_positions: Vec::new(),
             }),
             text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
@@ -1011,5 +1026,73 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    #[test]
+    fn test_split_at_pure_hebrew_after_first_character() {
+        let line = make_shaped_line("אבג", &[(4, 0.0), (2, 10.0), (0, 20.0)], 30.0, &[]);
+        let (left, right) = line.split_at("א".len());
+
+        assert_eq!(left.text.as_ref(), "א");
+        assert_eq!(right.text.as_ref(), "בג");
+        assert_eq!(left.width(), px(30.0));
+        assert_eq!(right.width(), px(0.0));
+        assert_eq!(left.x_for_index(0), px(30.0));
+        assert_eq!(right.x_for_index(0), px(0.0));
+    }
+
+    #[test]
+    fn test_split_at_persian_with_zwnj() {
+        let text = "می\u{200c}روم";
+        let split_index = "می\u{200c}".len();
+        let line = make_shaped_line(
+            text,
+            &[
+                (12, 0.0),
+                (10, 10.0),
+                (8, 20.0),
+                (5, 30.0),
+                (3, 40.0),
+                (0, 50.0),
+            ],
+            60.0,
+            &[],
+        );
+        let (left, right) = line.split_at(split_index);
+
+        assert_eq!(left.text.as_ref(), "می\u{200c}");
+        assert_eq!(right.text.as_ref(), "روم");
+        assert_eq!(left.len() + right.len(), text.len());
+    }
+
+    #[test]
+    fn test_split_at_mixed_text_inside_rtl_run() {
+        let text = "abc אבג def";
+        let Some(bet_index) = text.find('ב') else {
+            panic!("expected bet in test text");
+        };
+        let line = make_shaped_line(
+            text,
+            &[
+                (0, 0.0),
+                (1, 10.0),
+                (2, 20.0),
+                (3, 30.0),
+                (8, 40.0),
+                (6, 50.0),
+                (4, 60.0),
+                (10, 70.0),
+                (11, 80.0),
+                (12, 90.0),
+                (13, 100.0),
+            ],
+            110.0,
+            &[],
+        );
+
+        let (left, right) = line.split_at(bet_index);
+        assert_eq!(left.text.as_ref(), "abc א");
+        assert_eq!(right.text.as_ref(), "בג def");
+        assert_eq!(left.len() + right.len(), text.len());
     }
 }

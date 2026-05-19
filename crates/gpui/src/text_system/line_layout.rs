@@ -8,6 +8,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
+use unicode_bidi::BidiInfo;
 
 use super::LineWrapper;
 
@@ -26,6 +27,17 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+    /// Bidi-aware caret stops, sorted by logical UTF-8 byte index.
+    pub index_positions: Vec<IndexPosition>,
+}
+
+/// A caret stop for a logical UTF-8 byte index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IndexPosition {
+    /// The logical UTF-8 byte index.
+    pub index: usize,
+    /// The visual x position for this logical boundary.
+    pub x: Pixels,
 }
 
 /// A run of text that has been shaped .
@@ -58,6 +70,30 @@ impl LineLayout {
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
+        } else if !self.index_positions.is_empty() {
+            let mut positions_by_x = self.index_positions.clone();
+            positions_by_x
+                .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some(first_position) = positions_by_x.first()
+                && x < first_position.x
+            {
+                return Some(first_position.index);
+            }
+
+            for window in positions_by_x.windows(2) {
+                let left = window[0];
+                let right = window[1];
+                if x >= left.x && x < right.x {
+                    return if left.index <= right.index {
+                        Some(left.index)
+                    } else {
+                        Some(right.index)
+                    };
+                }
+            }
+
+            positions_by_x.last().map(|position| position.index)
         } else {
             for run in self.runs.iter().rev() {
                 for glyph in run.glyphs.iter().rev() {
@@ -73,6 +109,19 @@ impl LineLayout {
     /// closest_index_for_x returns the character boundary closest to the given x coordinate
     /// (e.g. to handle aligning up/down arrow keys)
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        if !self.index_positions.is_empty() {
+            return self
+                .index_positions
+                .iter()
+                .min_by(|a, b| {
+                    (a.x - x)
+                        .abs()
+                        .partial_cmp(&(b.x - x).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map_or(self.len, |position| position.index);
+        }
+
         let mut prev_index = 0;
         let mut prev_x = px(0.);
 
@@ -103,6 +152,14 @@ impl LineLayout {
 
     /// The x position of the character at the given index
     pub fn x_for_index(&self, index: usize) -> Pixels {
+        if let Some(position) = self
+            .index_positions
+            .iter()
+            .find(|position| position.index >= index)
+        {
+            return position.x;
+        }
+
         for run in &self.runs {
             for glyph in &run.glyphs {
                 if glyph.index >= index {
@@ -111,6 +168,105 @@ impl LineLayout {
             }
         }
         self.width
+    }
+
+    pub(crate) fn compute_bidi_index_positions(&mut self, text: &str) {
+        self.index_positions.clear();
+        if text.is_empty() || !contains_rtl_or_bidi_control(text) {
+            return;
+        }
+
+        let bidi_info = BidiInfo::new(text, None);
+        if !bidi_info.has_rtl() {
+            return;
+        }
+
+        let Some(paragraph) = bidi_info.paragraphs.first() else {
+            return;
+        };
+        let (_levels, visual_runs) = bidi_info.visual_runs(paragraph, 0..text.len());
+        if visual_runs.is_empty() {
+            return;
+        }
+
+        let mut glyphs = self
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .collect::<Vec<_>>();
+        glyphs.sort_by(|a, b| {
+            a.position
+                .x
+                .partial_cmp(&b.position.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut run_edges = Vec::with_capacity(glyphs.len());
+        for (ix, glyph) in glyphs.iter().enumerate() {
+            let next_x = glyphs
+                .get(ix + 1)
+                .map_or(self.width, |next_glyph| next_glyph.position.x);
+            run_edges.push((glyph.index, glyph.position.x, next_x));
+        }
+
+        for visual_run in visual_runs {
+            let Some(level) = bidi_info.levels.get(visual_run.start) else {
+                continue;
+            };
+            let mut run_glyphs = run_edges
+                .iter()
+                .filter(|(index, _, _)| visual_run.contains(index))
+                .copied()
+                .collect::<Vec<_>>();
+            if run_glyphs.is_empty() {
+                continue;
+            }
+            run_glyphs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let run_left = run_glyphs
+                .first()
+                .map_or(Pixels::ZERO, |(_, left, _)| *left);
+            let run_right = run_glyphs.last().map_or(self.width, |(_, _, right)| *right);
+
+            let mut boundaries = text[visual_run.clone()]
+                .char_indices()
+                .map(|(offset, _)| visual_run.start + offset)
+                .chain([visual_run.end])
+                .collect::<Vec<_>>();
+            boundaries.sort_unstable();
+            boundaries.dedup();
+
+            if level.is_rtl() {
+                for boundary in boundaries {
+                    let x = if boundary == visual_run.start {
+                        run_right
+                    } else {
+                        run_glyphs
+                            .iter()
+                            .find(|(index, _, _)| *index < boundary)
+                            .map_or(run_left, |(_, left, _)| *left)
+                    };
+                    self.index_positions
+                        .push(IndexPosition { index: boundary, x });
+                }
+            } else {
+                for boundary in boundaries {
+                    let x = if boundary == visual_run.end {
+                        run_right
+                    } else {
+                        run_glyphs
+                            .iter()
+                            .find(|(index, _, _)| *index >= boundary)
+                            .map_or(run_left, |(_, left, _)| *left)
+                    };
+                    self.index_positions
+                        .push(IndexPosition { index: boundary, x });
+                }
+            }
+        }
+
+        self.index_positions.sort_by_key(|position| position.index);
+        self.index_positions.dedup_by_key(|position| position.index);
     }
 
     /// The corresponding Font at the given index
@@ -612,6 +768,7 @@ impl LineLayoutCache {
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
+            layout.compute_bidi_index_positions(&text);
 
             let key = Arc::new(CacheKey {
                 text,
@@ -761,6 +918,7 @@ impl LineLayoutCache {
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
         }
+        layout.compute_bidi_index_positions(&text);
 
         let key = Arc::new(HashedCacheKey {
             text_hash,
@@ -807,6 +965,22 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             }
         }
     }
+}
+
+fn contains_rtl_or_bidi_control(text: &str) -> bool {
+    text.chars().any(|character| {
+        matches!(
+            character,
+            '\u{0590}'..='\u{08ff}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{fb1d}'..='\u{fdff}'
+                | '\u{fe70}'..='\u{fefc}'
+                | '\u{10800}'..='\u{10fff}'
+                | '\u{1e800}'..='\u{1eFFF}'
+        )
+    })
 }
 
 /// A run of text with a single font.
@@ -982,6 +1156,7 @@ mod tests {
                 glyphs,
             }],
             len: 0,
+            index_positions: Vec::new(),
         }
     }
 
@@ -1074,5 +1249,164 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+    #[test]
+    fn test_bidi_index_positions_for_hebrew_line() {
+        let text = "אבג";
+        let mut layout = LineLayout {
+            font_size: px(16.),
+            width: px(30.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![glyph_at(0., 4), glyph_at(10., 2), glyph_at(20., 0)],
+            }],
+            len: text.len(),
+            index_positions: Vec::new(),
+        };
+
+        layout.compute_bidi_index_positions(text);
+
+        assert_eq!(layout.x_for_index(0), px(30.));
+        assert_eq!(layout.x_for_index("א".len()), px(20.));
+        assert_eq!(layout.x_for_index("אב".len()), px(10.));
+        assert_eq!(layout.x_for_index(text.len()), px(0.));
+        assert_eq!(layout.closest_index_for_x(px(29.)), 0);
+        assert_eq!(layout.closest_index_for_x(px(1.)), text.len());
+        assert_eq!(layout.index_for_x(px(29.)), Some(0));
+        assert_eq!(layout.index_for_x(px(1.)), Some(text.len()));
+    }
+
+    #[test]
+    fn test_bidi_index_positions_for_arabic_and_persian_zwnj_lines() {
+        for text in ["مرحبا", "می\u{200c}روم"] {
+            let character_indices = text
+                .char_indices()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let mut glyphs = character_indices
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(position, index)| glyph_at(position as f32 * 10., *index))
+                .collect::<Vec<_>>();
+            let width = glyphs.len() as f32 * 10.;
+            let mut layout = LineLayout {
+                font_size: px(16.),
+                width: px(width),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: std::mem::take(&mut glyphs),
+                }],
+                len: text.len(),
+                index_positions: Vec::new(),
+            };
+
+            layout.compute_bidi_index_positions(text);
+
+            assert_eq!(layout.x_for_index(0), px(width));
+            assert_eq!(layout.x_for_index(text.len()), px(0.));
+            assert_eq!(layout.closest_index_for_x(px(width - 1.)), 0);
+            assert_eq!(layout.closest_index_for_x(px(1.)), text.len());
+            assert_eq!(layout.index_for_x(px(width - 1.)), Some(0));
+            assert_eq!(layout.index_for_x(px(1.)), Some(text.len()));
+        }
+    }
+
+    #[test]
+    fn test_bidi_index_positions_for_mixed_ltr_and_hebrew_line() {
+        let text = "abc אבג def";
+        let Some(alef) = text.find('א') else {
+            panic!("expected alef in test text");
+        };
+        let Some(bet) = text.find('ב') else {
+            panic!("expected bet in test text");
+        };
+        let Some(gimel) = text.find('ג') else {
+            panic!("expected gimel in test text");
+        };
+        let after_gimel = gimel + 'ג'.len_utf8();
+        let mut layout = LineLayout {
+            font_size: px(16.),
+            width: px(110.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    glyph_at(0., 0),
+                    glyph_at(10., 1),
+                    glyph_at(20., 2),
+                    glyph_at(30., 3),
+                    glyph_at(40., gimel),
+                    glyph_at(50., bet),
+                    glyph_at(60., alef),
+                    glyph_at(70., after_gimel),
+                    glyph_at(80., after_gimel + 1),
+                    glyph_at(90., after_gimel + 2),
+                    glyph_at(100., after_gimel + 3),
+                ],
+            }],
+            len: text.len(),
+            index_positions: Vec::new(),
+        };
+
+        layout.compute_bidi_index_positions(text);
+
+        assert_eq!(layout.x_for_index(bet), px(60.));
+        assert_eq!(layout.x_for_index(gimel), px(50.));
+        assert_eq!(layout.closest_index_for_x(px(59.)), bet);
+        assert_eq!(layout.closest_index_for_x(px(51.)), gimel);
+        assert_eq!(layout.index_for_x(px(55.)), Some(bet));
+        assert_eq!(layout.index_for_x(px(45.)), Some(gimel));
+    }
+
+    #[test]
+    fn test_index_for_x_for_mixed_english_and_arabic_punctuation() {
+        let text = "x (مرحبا) y";
+        let Some(arabic_start) = text.find('م') else {
+            panic!("expected arabic text in test");
+        };
+        let Some(arabic_second) = text.find('ر') else {
+            panic!("expected arabic text in test");
+        };
+        let Some(arabic_end) = text.find('ا') else {
+            panic!("expected arabic text in test");
+        };
+        let after_arabic = arabic_end + 'ا'.len_utf8();
+
+        let mut layout = LineLayout {
+            font_size: px(16.),
+            width: px(110.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    glyph_at(0., 0),
+                    glyph_at(10., 1),
+                    glyph_at(20., 2),
+                    glyph_at(30., after_arabic),
+                    glyph_at(40., arabic_end),
+                    glyph_at(50., arabic_second),
+                    glyph_at(60., arabic_start),
+                    glyph_at(70., after_arabic + 1),
+                    glyph_at(80., after_arabic + 2),
+                    glyph_at(90., after_arabic + 3),
+                    glyph_at(100., after_arabic + 4),
+                ],
+            }],
+            len: text.len(),
+            index_positions: Vec::new(),
+        };
+
+        layout.compute_bidi_index_positions(text);
+
+        assert_eq!(layout.index_for_x(px(59.)), Some(arabic_start));
+        assert_eq!(layout.index_for_x(px(49.)), Some(arabic_second));
+        assert_eq!(layout.index_for_x(px(39.)), Some(arabic_end));
     }
 }
